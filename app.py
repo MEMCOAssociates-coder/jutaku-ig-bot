@@ -48,6 +48,25 @@ app = Flask(__name__)
 
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
+
+
+def _parse_page_tokens(raw: str) -> dict:
+    """PAGE_TOKENS="<IG account ID>:<Page token>,<IG account ID>:<Page token>"
+    — one entry per Instagram account the bot answers. Each Instagram
+    account replies with the token of the Facebook Page it's linked to."""
+    tokens = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if ":" in part:
+            account_id, token = part.split(":", 1)
+            if account_id.strip() and token.strip():
+                tokens[account_id.strip()] = token.strip()
+    return tokens
+
+
+# Several accounts: PAGE_TOKENS. One account: PAGE_ACCESS_TOKEN still works
+# on its own (used for any account not listed in PAGE_TOKENS).
+PAGE_TOKENS = _parse_page_tokens(os.environ.get("PAGE_TOKENS", ""))
 APP_SECRET = os.environ.get("APP_SECRET", "")
 GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v19.0")
 SEND_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/messages"
@@ -76,20 +95,37 @@ def detect_flow(text: str):
 
 
 # --------------------------------------------------------------- sending --
-def send_message(recipient_id: str, text: str):
-    if not PAGE_ACCESS_TOKEN:
-        log.warning("PAGE_ACCESS_TOKEN not set — would have sent: %s", text)
+def token_for(account_id: str) -> str:
+    return PAGE_TOKENS.get(account_id or "") or PAGE_ACCESS_TOKEN
+
+
+def send_message(account_id: str, recipient_id: str, text: str):
+    """Sends from the Instagram account the conversation is on."""
+    token = token_for(account_id)
+    if not token:
+        log.warning("No Page token for account %s — would have sent: %s", account_id or "(default)", text)
         return
     resp = requests.post(
         SEND_URL,
-        params={"access_token": PAGE_ACCESS_TOKEN},
+        params={"access_token": token},
         json={"recipient": {"id": recipient_id}, "message": {"text": text}},
         timeout=10,
     )
     if resp.status_code != 200:
         log.error("Failed to send message: %s %s", resp.status_code, resp.text)
     else:
-        log.info("Sent -> %s: %.60s", recipient_id, text)
+        log.info("Sent [%s] -> %s: %.60s", account_id or "default", recipient_id, text)
+
+
+def sender_for(account_id: str):
+    """A (recipient_id, text) send function bound to one Instagram account —
+    what the flows in flows.py call to reply."""
+    return lambda recipient_id, text: send_message(account_id, recipient_id, text)
+
+
+def default_account() -> str:
+    """The only configured account, when there's exactly one."""
+    return next(iter(PAGE_TOKENS)) if len(PAGE_TOKENS) == 1 else ""
 
 
 # ------------------------------------------------------- start_flow (admin) --
@@ -100,9 +136,11 @@ def start_flow():
 
         POST /start_flow
         X-Admin-Token: <ADMIN_TOKEN>
-        { "sender_id": "<IGSID>", "flow": "rent" }
+        { "sender_id": "<IGSID>", "flow": "rent", "account": "<IG account ID>" }
 
-    flow is one of "rent", "share", "loan".
+    flow is one of "rent", "share", "loan". account is the Instagram account
+    the opening message went out from — required when the bot answers more
+    than one account (PAGE_TOKENS), optional with just one.
     """
     if ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
         return jsonify(error="unauthorized"), 401
@@ -112,10 +150,13 @@ def start_flow():
     flow = body.get("flow")
     if not sender_id or flow not in ("rent", "share", "loan"):
         return jsonify(error="sender_id and flow ('rent'|'share'|'loan') required"), 400
+    account_id = str(body.get("account") or default_account())
+    if len(PAGE_TOKENS) > 1 and account_id not in PAGE_TOKENS:
+        return jsonify(error="account required — one of: " + ", ".join(PAGE_TOKENS)), 400
 
-    session = start_session(sender_id, flow)
-    disclose_once(session, send_message)
-    return jsonify(status="started", sender_id=sender_id, flow=flow), 200
+    session = start_session(sender_id, flow, account_id)
+    disclose_once(session, sender_for(account_id))
+    return jsonify(status="started", sender_id=sender_id, flow=flow, account=account_id), 200
 
 
 # ------------------------------------------------------------ Meta webhook --
@@ -150,19 +191,30 @@ def webhook():
         return jsonify(status="ignored"), 200
 
     for entry in data.get("entry", []):
+        # entry.id = the Instagram account that received the message
+        account_id = str(entry.get("id") or "")
         for event in entry.get("messaging", []):
+            message = event.get("message") or {}
             sender_id = event.get("sender", {}).get("id")
-            text = event.get("message", {}).get("text")
+            text = message.get("text")
+            # Instagram also sends a copy ("echo") of every message the bot
+            # itself sends — never treat those as a customer message.
+            if message.get("is_echo") or (sender_id and sender_id == account_id):
+                continue
+            if PAGE_TOKENS and account_id not in PAGE_TOKENS and not PAGE_ACCESS_TOKEN:
+                log.warning("Message for account %s, which has no Page token — ignored", account_id)
+                continue
             if sender_id and text:
-                handle_inbound(sender_id, text)
+                handle_inbound(account_id, sender_id, text)
 
     return jsonify(status="ok"), 200
 
 
 # --------------------------------------------------------------- routing --
-def handle_inbound(sender_id: str, text: str):
+def handle_inbound(account_id: str, sender_id: str, text: str):
     numbers = extract_numbers(text)
-    session = get_session(sender_id)
+    send = sender_for(account_id)
+    session = get_session(sender_id, account_id)
 
     if session is None:
         # No one called /start_flow for this lead — they messaged in on
@@ -170,15 +222,15 @@ def handle_inbound(sender_id: str, text: str):
         # equivalent to the diagram's "Did they reply? -> Yes" branch.
         flow = detect_flow(text)
         if not flow:
-            send_message(
+            send(
                 sender_id,
                 "🤖 You're chatting with the JUTAKU automated assistant, not a "
                 "person. Tell me if you want to know about *Rent*, *Share*, "
                 "or *Loan* eligibility, and I'll walk you through it.",
             )
             return
-        session = start_session(sender_id, flow)
-        disclose_once(session, send_message)
+        session = start_session(sender_id, flow, account_id)
+        disclose_once(session, send)
         if numbers:
             # They front-loaded the number(s) already — skip straight past
             # the "ask for it" step into the amount-handling state.
@@ -187,13 +239,13 @@ def handle_inbound(sender_id: str, text: str):
                 "share": "awaiting_xy",
                 "loan": "awaiting_takehome",
             }[flow]
-            HANDLERS[flow](session, text, numbers, send_message)
+            HANDLERS[flow](session, text, numbers, send)
         else:
-            HANDLERS[flow](session, text, numbers, send_message)
+            HANDLERS[flow](session, text, numbers, send)
         return
 
-    disclose_once(session, send_message)
-    HANDLERS[session.flow](session, text, numbers, send_message)
+    disclose_once(session, send)
+    HANDLERS[session.flow](session, text, numbers, send)
 
 
 # ------------------------------------------------------------- scheduler --
@@ -202,7 +254,7 @@ def handle_inbound(sender_id: str, text: str):
 # APScheduler's auto-detection at import time.
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
-    lambda: check_timeouts(send_message, wait_minutes=WAIT_MINUTES),
+    lambda: check_timeouts(sender_for, wait_minutes=WAIT_MINUTES),
     "interval",
     minutes=1,
     id="timeout_check",
@@ -212,7 +264,8 @@ scheduler.start()
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify(status="jutaku-ig-bot running", open_sessions=len(SESSIONS)), 200
+    return jsonify(status="jutaku-ig-bot running", open_sessions=len(SESSIONS),
+                   accounts=sorted(PAGE_TOKENS) or (["default"] if PAGE_ACCESS_TOKEN else [])), 200
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ class Session:
     sender_id: str
     flow: str  # "rent" | "share" | "loan"
     state: str  # see STATES per flow below
+    account_id: str = ""  # the Instagram account (IG business ID) the conversation is on
     data: dict = field(default_factory=dict)
     last_update: float = field(default_factory=time.time)
     disclosed: bool = False
@@ -46,25 +47,27 @@ class Session:
         self.last_update = time.time()
 
 
-# In-memory store: sender_id -> Session. Swap for Redis/a DB in production
-# (see README) so state survives restarts and works across many workers.
-SESSIONS: dict[str, Session] = {}
+# In-memory store: (account_id, sender_id) -> Session. One conversation per
+# person per Instagram account — the same customer messaging both accounts
+# gets two separate conversations. Swap for Redis/a DB in production (see
+# README) so state survives restarts and works across many workers.
+SESSIONS: dict[tuple, Session] = {}
 
 
-def get_session(sender_id: str) -> Optional[Session]:
-    return SESSIONS.get(sender_id)
+def get_session(sender_id: str, account_id: str = "") -> Optional[Session]:
+    return SESSIONS.get((account_id, sender_id))
 
 
-def start_session(sender_id: str, flow: str) -> Session:
+def start_session(sender_id: str, flow: str, account_id: str = "") -> Session:
     """Call this the moment the opening 'DM Sent' message goes out, to
     begin tracking the 'Did they reply?' timer for that lead."""
-    s = Session(sender_id=sender_id, flow=flow, state="awaiting_first_reply")
-    SESSIONS[sender_id] = s
+    s = Session(sender_id=sender_id, flow=flow, state="awaiting_first_reply", account_id=account_id)
+    SESSIONS[(account_id, sender_id)] = s
     return s
 
 
-def end_session(sender_id: str):
-    SESSIONS.pop(sender_id, None)
+def end_session(sender_id: str, account_id: str = ""):
+    SESSIONS.pop((account_id, sender_id), None)
 
 
 # ------------------------------------------------------------- messaging --
@@ -128,7 +131,7 @@ def _finish_rent(session: Session, x: float, send: SendFn):
     result = calculate_rent(x)
     send(session.sender_id, _rent_year_by_year(x, result.x_hat))
     send(session.sender_id, _rent_outcome(result.x_hat))
-    end_session(session.sender_id)
+    end_session(session.sender_id, session.account_id)
 
 
 def handle_rent_reply(session: Session, text: str, numbers: list, send: SendFn):
@@ -211,7 +214,7 @@ def _finish_share(session: Session, x: float, y: float, send: SendFn):
         f"👤 Final — His/Her Share = ₹{result.final_share:,.0f}\n"
         "What each flatmate individually puts toward ownership.",
     )
-    end_session(session.sender_id)
+    end_session(session.sender_id, session.account_id)
 
 
 def handle_share_reply(session: Session, text: str, numbers: list, send: SendFn):
@@ -270,7 +273,7 @@ def _finish_loan(session: Session, take_home: float, send: SendFn):
         session.sender_id,
         LOAN_ELIGIBLE_MSG if result.meets_benchmark else LOAN_NOT_ELIGIBLE_MSG,
     )
-    end_session(session.sender_id)
+    end_session(session.sender_id, session.account_id)
 
 
 def handle_loan_reply(session: Session, text: str, numbers: list, send: SendFn):
@@ -314,11 +317,12 @@ TIMEOUT_HANDLERS = {
 }
 
 
-def check_timeouts(send: SendFn, wait_minutes: float = DEFAULT_WAIT_MINUTES):
+def check_timeouts(send_for: Callable[[str], SendFn], wait_minutes: float = DEFAULT_WAIT_MINUTES):
     """Call this periodically (see app.py's scheduler). Finds every session
     that's been waiting longer than wait_minutes and fires that flow's
     'no response' behaviour, exactly matching the diagram's timeout
-    branches."""
+    branches. send_for(account_id) gives the send function for the
+    Instagram account the conversation is on, so the reply comes from it."""
     cutoff = time.time() - wait_minutes * 60
     stale = [
         s
@@ -328,4 +332,4 @@ def check_timeouts(send: SendFn, wait_minutes: float = DEFAULT_WAIT_MINUTES):
         and s.last_update < cutoff
     ]
     for session in stale:
-        TIMEOUT_HANDLERS[session.flow](session, send)
+        TIMEOUT_HANDLERS[session.flow](session, send_for(session.account_id))

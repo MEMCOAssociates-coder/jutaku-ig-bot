@@ -35,9 +35,20 @@ asking for it again.
 ## What you need (you said this part is already done)
 
 - A Meta Developer App with the **Instagram Messaging** product added.
-- An Instagram **Business/Creator** account linked to a Facebook Page.
-- The Page's **access token** (Meta App Dashboard → your app → Instagram →
-  API setup → Generate token).
+- An Instagram **Business/Creator** account linked to a Facebook Page — or
+  several (the bot can answer more than one Instagram account; each replies
+  from its own account).
+- Each linked **Facebook Page's access token** (it starts with `EAA…`; replies
+  go through `graph.facebook.com`). Get it in Graph API Explorer: Generate
+  Access Token with `instagram_basic`, `instagram_manage_messages`,
+  `pages_show_list`, `pages_manage_metadata`, `pages_read_engagement` →
+  extend it in the Access Token Debugger → `GET me/accounts?fields=name,id,
+  access_token,instagram_business_account` → copy each Page's
+  `access_token`. Check it in the debugger: Type **Page**, Expires **Never**.
+  (The token from *Instagram → API setup → Generate token* is an Instagram
+  user token for `graph.instagram.com` and does NOT work with this bot.)
+- In each Instagram app: Settings → Messages and story replies → Message
+  controls → Connected tools → **Allow access to messages** on.
 
 ## Setup steps
 
@@ -49,7 +60,10 @@ asking for it again.
 2. **Configure environment variables** — copy `.env.example` to `.env` and
    fill in:
    - `VERIFY_TOKEN` — any string you make up (Meta echoes it back during setup)
-   - `PAGE_ACCESS_TOKEN` — from the Meta dashboard
+   - `PAGE_TOKENS` — one `<Instagram account ID>:<Page token>` pair per
+     account, comma-separated (the Instagram account ID is the
+     `instagram_business_account.id` from `me/accounts`). With a single
+     account you can use `PAGE_ACCESS_TOKEN` instead.
    - `APP_SECRET` — from Meta App Dashboard → App Settings → Basic (recommended)
    - `ADMIN_TOKEN` — any string you make up, protects `/start_flow`
    - `WAIT_MINUTES` — how long to wait for a reply before the fallback fires (default 60)
@@ -79,8 +93,10 @@ asking for it again.
    curl -X POST https://<your-domain>/start_flow \
      -H "X-Admin-Token: <ADMIN_TOKEN>" \
      -H "Content-Type: application/json" \
-     -d '{"sender_id": "<IGSID>", "flow": "rent"}'
+     -d '{"sender_id": "<IGSID>", "flow": "rent", "account": "<Instagram account ID>"}'
    ```
+   `account` = the Instagram account the opening DM went out from (required
+   when the bot answers more than one account).
 
 7. **Test it** — DM your Instagram account "rent 25000" from another
    account. You should get the bot disclosure, the year-by-year projection,
