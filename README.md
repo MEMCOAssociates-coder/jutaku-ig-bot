@@ -122,3 +122,20 @@ Meta requires this for any automated chat experience. It's handled by
   Note: APScheduler's background thread only runs reliably with a single
   worker process (`gunicorn -w 1 app:app`) unless you move the scheduler to
   a separate process — ask me if you want that set up for higher traffic.
+
+
+## Message counts for the CRM's Campaign Reports
+
+Every DM the bot receives is counted in `stats.db` (SQLite, next to `app.py`, or `STATS_DB`):
+the Instagram account, the ad the person tapped to message (Meta's referral on ad-started
+chats), whether the bot answered, and whether it looked like spam. The sender is stored only
+as a one-way hash — no names, IDs or message text.
+
+* **Spam** (links, follower / promotion / crypto offers and the like — see `stats.py`) is not
+  answered and is counted as spam.
+* **Not auto replied** = photo / sticker / story-reply-only messages, spam, or a reply that
+  failed to send.
+
+The CRM reads totals from `GET /stats?from=YYYY-MM-DD&to=YYYY-MM-DD` with the header
+`X-Stats-Key: <STATS_KEY>`. Set `STATS_KEY` here and the same value as `IG_BOT_STATS_KEY`
+in the CRM's `.env` (plus `IG_BOT_STATS_URL` if the bot is not on `http://127.0.0.1:5000`).

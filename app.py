@@ -31,6 +31,7 @@ from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import flows
+import stats
 from flows import (
     SESSIONS,
     get_session,
@@ -104,7 +105,7 @@ def send_message(account_id: str, recipient_id: str, text: str):
     token = token_for(account_id)
     if not token:
         log.warning("No Page token for account %s — would have sent: %s", account_id or "(default)", text)
-        return
+        return False
     resp = requests.post(
         SEND_URL,
         params={"access_token": token},
@@ -113,8 +114,9 @@ def send_message(account_id: str, recipient_id: str, text: str):
     )
     if resp.status_code != 200:
         log.error("Failed to send message: %s %s", resp.status_code, resp.text)
-    else:
-        log.info("Sent [%s] -> %s: %.60s", account_id or "default", recipient_id, text)
+        return False
+    log.info("Sent [%s] -> %s: %.60s", account_id or "default", recipient_id, text)
+    return True
 
 
 def sender_for(account_id: str):
@@ -201,19 +203,47 @@ def webhook():
             # itself sends — never treat those as a customer message.
             if message.get("is_echo") or (sender_id and sender_id == account_id):
                 continue
+            if not sender_id or "message" not in event:
+                continue  # reads, reactions etc. — not a message
+            # the ad the person tapped to message us (Meta adds a referral on ad-started chats)
+            referral = event.get("referral") or message.get("referral") or {}
+            ad_id = referral.get("ad_id") or (referral.get("ads_context_data") or {}).get("ad_id")
             if PAGE_TOKENS and account_id not in PAGE_TOKENS and not PAGE_ACCESS_TOKEN:
                 log.warning("Message for account %s, which has no Page token — ignored", account_id)
+                stats.record(account_id, sender_id, ad_id, replied=False, kind="no_token")
                 continue
-            if sender_id and text:
-                handle_inbound(account_id, sender_id, text)
+            if not text:
+                # photo / sticker / story reply only — nothing the flows can answer
+                stats.record(account_id, sender_id, ad_id, replied=False, kind="media")
+                continue
+            if stats.is_spam(text):
+                log.info("Spam DM on account %s — not answered", account_id)
+                stats.record(account_id, sender_id, ad_id, replied=False, spam=True)
+                continue
+            replied = handle_inbound(account_id, sender_id, text)
+            stats.record(account_id, sender_id, ad_id, replied=bool(replied))
 
     return jsonify(status="ok"), 200
 
 
 # --------------------------------------------------------------- routing --
-def handle_inbound(account_id: str, sender_id: str, text: str):
+def handle_inbound(account_id: str, sender_id: str, text: str) -> bool:
+    """Answers one message; True when the bot sent at least one reply."""
+    sent = []
+    base_send = sender_for(account_id)
+
+    def send(recipient_id, reply_text):
+        ok = base_send(recipient_id, reply_text)
+        if ok:
+            sent.append(1)
+        return ok
+
+    _route(account_id, sender_id, text, send)
+    return bool(sent)
+
+
+def _route(account_id: str, sender_id: str, text: str, send):
     numbers = extract_numbers(text)
-    send = sender_for(account_id)
     session = get_session(sender_id, account_id)
 
     if session is None:
@@ -260,6 +290,18 @@ scheduler.add_job(
     id="timeout_check",
 )
 scheduler.start()
+
+
+@app.route("/stats", methods=["GET"])
+def message_stats():
+    """Totals for the CRM's Campaign Reports — needs the X-Stats-Key header."""
+    key = os.environ.get("STATS_KEY", "")
+    if not key or not hmac.compare_digest(request.headers.get("X-Stats-Key", ""), key):
+        return jsonify(error="not allowed"), 403
+    day_from, day_to = request.args.get("from", ""), request.args.get("to", "")
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", day_from) or not re.match(r"^\d{4}-\d{2}-\d{2}$", day_to):
+        return jsonify(error="from and to dates (YYYY-MM-DD) are required"), 400
+    return jsonify(rows=stats.totals(day_from, day_to)), 200
 
 
 @app.route("/", methods=["GET"])
